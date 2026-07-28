@@ -7,9 +7,9 @@ use screenpipe_core::Language;
 use windows::{
     core::HSTRING,
     Globalization::Language as WindowsLanguage,
-    Graphics::Imaging::BitmapDecoder,
+    Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap},
     Media::Ocr::OcrEngine as WindowsOcrEngine,
-    Storage::Streams::{DataWriter, InMemoryRandomAccessStream},
+    Storage::Streams::DataWriter,
 };
 
 #[cfg(target_os = "windows")]
@@ -17,8 +17,6 @@ pub async fn perform_ocr_windows(
     image: &DynamicImage,
     languages: &[Language],
 ) -> Result<(String, String, Option<f64>)> {
-    use std::io::Cursor;
-
     // Check image dimensions
     let (width, height) = image.dimensions();
     if width == 0 || height == 0 {
@@ -26,22 +24,44 @@ pub async fn perform_ocr_windows(
         return Ok(("".to_string(), "[]".to_string(), None));
     }
 
-    let mut buffer = Vec::new();
-    image
-        .write_to(&mut Cursor::new(&mut buffer), image::ImageFormat::Png)
-        .map_err(|e| anyhow::anyhow!("Failed to write image to buffer: {}", e))?;
+    let bgra = image_to_bgra(image);
+    let languages = languages.to_vec();
 
-    let stream = InMemoryRandomAccessStream::new()?;
-    let writer = DataWriter::CreateDataWriter(&stream)?;
-    writer.WriteBytes(&buffer)?;
-    writer.StoreAsync()?.get()?;
-    writer.FlushAsync()?.get()?;
-    stream.Seek(0)?;
+    // Every WinRT call in `recognize_bgra` blocks; running them on a runtime
+    // worker stalled it for the whole recognition (~110ms measured) (#4841).
+    tokio::task::spawn_blocking(move || recognize_bgra(&bgra, width, height, &languages))
+        .await
+        .map_err(|e| anyhow!("windows ocr worker failed: {}", e))?
+}
 
-    let decoder =
-        BitmapDecoder::CreateWithIdAsync(BitmapDecoder::PngDecoderId()?, &stream)?.get()?;
+/// Windows OCR wants BGRA8; `image` gives RGBA8. Swapping two bytes per pixel
+/// replaces the PNG encode/decode round trip this used to pay (#4841).
+#[cfg(target_os = "windows")]
+fn image_to_bgra(image: &DynamicImage) -> Vec<u8> {
+    let mut bgra = image.to_rgba8().into_raw();
+    for px in bgra.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    bgra
+}
 
-    let bitmap = decoder.GetSoftwareBitmapAsync()?.get()?;
+#[cfg(target_os = "windows")]
+fn recognize_bgra(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    languages: &[Language],
+) -> Result<(String, String, Option<f64>)> {
+    let writer = DataWriter::new()?;
+    writer.WriteBytes(bgra)?;
+    let buffer = writer.DetachBuffer()?;
+
+    let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
+        &buffer,
+        BitmapPixelFormat::Bgra8,
+        width as i32,
+        height as i32,
+    )?;
 
     let (engine, recognizer_language) = create_windows_ocr_engine(languages)?;
     tracing::debug!(
@@ -289,5 +309,97 @@ mod tests {
     fn windows_language_tags_default_to_core_lang_code() {
         let tags = windows_language_tags_for(&Language::Catalan);
         assert_eq!(tags, vec!["ca"]);
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod stage_timing {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    fn summarize(label: &str, mut samples: Vec<Duration>) {
+        samples.sort();
+        let n = samples.len();
+        let mean = samples.iter().sum::<Duration>() / n as u32;
+        println!(
+            "{:<20} mean {:>10?}  p50 {:>10?}  p90 {:>10?}",
+            label,
+            mean,
+            samples[n / 2],
+            samples[(n * 9 / 10).min(n - 1)]
+        );
+    }
+
+    /// Attributes `perform_ocr_windows` cost to its stages (#4841). Measurement
+    /// only, no assertions — hence `#[ignore]`; run it explicitly:
+    /// `cargo test -p screenpipe-screen --profile release-dev stage_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn ocr_stage_costs() {
+        const ITERS: usize = 20;
+
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests");
+        path.push("testing_OCR.png");
+        let image = image::open(&path).expect("open test image");
+        let (width, height) = image.dimensions();
+        println!("image {}x{}  iters={}\n", width, height, ITERS);
+
+        let mut convert = Vec::new();
+        let mut buffer_write = Vec::new();
+        let mut bitmap_create = Vec::new();
+        let mut engine_create = Vec::new();
+        let mut recognize = Vec::new();
+        let mut extract = Vec::new();
+
+        for _ in 0..ITERS {
+            let t = Instant::now();
+            let bgra = image_to_bgra(&image);
+            convert.push(t.elapsed());
+
+            let t = Instant::now();
+            let writer = DataWriter::new().unwrap();
+            writer.WriteBytes(&bgra).unwrap();
+            let buffer = writer.DetachBuffer().unwrap();
+            buffer_write.push(t.elapsed());
+
+            let t = Instant::now();
+            let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
+                &buffer,
+                BitmapPixelFormat::Bgra8,
+                width as i32,
+                height as i32,
+            )
+            .unwrap();
+            bitmap_create.push(t.elapsed());
+
+            let t = Instant::now();
+            let (engine, _tag) = create_windows_ocr_engine(&[]).expect("ocr engine");
+            engine_create.push(t.elapsed());
+
+            let t = Instant::now();
+            let result = engine.RecognizeAsync(&bitmap).unwrap().get().unwrap();
+            recognize.push(t.elapsed());
+
+            let t = Instant::now();
+            let mut words = 0usize;
+            for line in result.Lines().unwrap() {
+                for word in line.Words().unwrap() {
+                    let _ = word.Text().unwrap();
+                    let _ = word.BoundingRect().unwrap();
+                    words += 1;
+                }
+            }
+            extract.push(t.elapsed());
+            std::hint::black_box(words);
+        }
+
+        summarize("bgra_convert", convert);
+        summarize("buffer_write", buffer_write);
+        summarize("bitmap_create", bitmap_create);
+        summarize("engine_create", engine_create);
+        summarize("recognize", recognize);
+        summarize("extract_words", extract);
     }
 }
