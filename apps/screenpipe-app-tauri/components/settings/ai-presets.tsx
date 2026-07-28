@@ -371,6 +371,10 @@ const AISection = ({
   }, [settingsPreset?.provider]);
 
 
+  const modelPickerNeedsApiKey = settingsPreset?.provider
+    ? providerRequiresApiKey(settingsPreset.provider) && !settingsPreset.apiKey
+    : false;
+
   const isFormValid = useMemo(() => {
     return Object.keys(validationErrors).length === 0 && 
            settingsPreset?.id && 
@@ -1448,15 +1452,9 @@ const AISection = ({
                   "w-full justify-between",
                   !settingsPreset?.model && "text-muted-foreground"
                 )}
-                disabled={
-                  !!settingsPreset?.provider &&
-                  providerRequiresApiKey(settingsPreset.provider) &&
-                  !settingsPreset?.apiKey
-                }
+                disabled={modelPickerNeedsApiKey}
               >
-                {!!settingsPreset?.provider &&
-                providerRequiresApiKey(settingsPreset.provider) &&
-                !settingsPreset?.apiKey
+                {modelPickerNeedsApiKey
                   ? "API key required to fetch models"
                   : settingsPreset?.model || "Select model..."}
                 <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
