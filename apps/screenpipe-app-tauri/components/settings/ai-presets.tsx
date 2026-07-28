@@ -117,9 +117,12 @@ import {
   validatePresetName,
   validateUrl,
   validateApiKey,
+  providerRequiresApiKey,
+  CUSTOM_API_KEY_PLACEHOLDER,
   debounce,
   FieldValidationResult
 } from "@/lib/utils/validation";
+import { describeProviderError } from "@/lib/utils/provider-error";
 import {
   DEFAULT_ENTERPRISE_AI_PRESET_POLICY,
   filterPresetsForEnterprisePolicy,
@@ -309,15 +312,13 @@ const AISection = ({
       const errors: Record<string, string> = {};
 
       // Validate name
-      if (presetData.id) {
-        const nameValidation = validatePresetName(
-          presetData.id,
-          visiblePresets,
-          preset?.id
-        );
-        if (!nameValidation.isValid && nameValidation.error) {
-          errors.id = nameValidation.error;
-        }
+      const nameValidation = validatePresetName(
+        presetData.id ?? "",
+        visiblePresets,
+        preset?.id
+      );
+      if (!nameValidation.isValid && nameValidation.error) {
+        errors.id = nameValidation.error;
       }
       
       // Validate URL
@@ -329,8 +330,8 @@ const AISection = ({
       }
       
       // Validate API key
-      if (presetData.apiKey && presetData.provider) {
-        const apiKeyValidation = validateApiKey(presetData.apiKey, presetData.provider);
+      if (presetData.provider) {
+        const apiKeyValidation = validateApiKey(presetData.apiKey ?? "", presetData.provider);
         if (!apiKeyValidation.isValid && apiKeyValidation.error) {
           errors.apiKey = apiKeyValidation.error;
         }
@@ -554,14 +555,6 @@ const AISection = ({
     setChatgptLoggedIn(false);
     // chatgptChecking is managed by the status-check effect, not here
 
-    const defaultNames: Record<string, string> = {
-      "openai-chatgpt": "chatgpt",
-      "openai": "openai",
-      "anthropic": "claude",
-      "native-ollama": "ollama",
-      "screenpipe-cloud": "screenpipe-cloud",
-    };
-
     let newUrl = "";
     let newModel = settingsPreset?.model;
 
@@ -589,13 +582,9 @@ const AISection = ({
         break;
     }
 
-    const updates: Partial<AIPreset> = { provider: newValue, url: newUrl, model: newModel };
-    // Auto-fill name only when creating a new preset (no existing id)
-    if (!settingsPreset?.id && defaultNames[newValue]) {
-      updates.id = defaultNames[newValue];
-    }
-
-    updateSettingsPreset(updates);
+    // No name auto-fill: the name is a required field the user must supply, and a
+    // silent default let presets be created without one (#5482).
+    updateSettingsPreset({ provider: newValue, url: newUrl, model: newModel });
   }, [settingsPreset?.id, settingsPreset?.url, settingsPreset?.model, updateSettingsPreset]);
 
   const [models, setModels] = useState<AIModel[]>([]);
@@ -666,6 +655,9 @@ const AISection = ({
       headers["anthropic-dangerous-direct-browser-access"] = "true";
     } else if (settingsPreset?.apiKey) {
       headers["Authorization"] = `Bearer ${settingsPreset.apiKey}`;
+    } else if (settingsPreset?.provider === "custom") {
+      // Same token the pipe runtime sends, so diagnostics exercise the real request (#5482).
+      headers["Authorization"] = `Bearer ${CUSTOM_API_KEY_PLACEHOLDER}`;
     }
 
     // Step 1+2+3: Fetch models endpoint (tests endpoint, auth, and models in one call)
@@ -731,14 +723,23 @@ const AISection = ({
           chat: { status: "running", message: "Sending test message..." },
         }));
       } else if (modelsResponse!.status === 401 || modelsResponse!.status === 403) {
+        const body = await modelsResponse!.text().catch(() => "");
+        // A keyless custom preset reaching here means the endpoint is not actually
+        // unauthenticated, which is the only actionable thing to say (#5482).
         const hint =
-          settingsPreset?.provider === "openai"
-            ? "Check your API key at platform.openai.com"
-            : "Check your API key is valid and has credits";
-        skipRemaining("auth", `${modelsResponse!.status} Unauthorized. ${hint}`);
+          settingsPreset?.provider === "custom" && !settingsPreset?.apiKey
+            ? "This endpoint requires an API key — add one to this preset."
+            : settingsPreset?.provider === "openai"
+              ? "Check your API key at platform.openai.com."
+              : "Check the API key is valid and has credits.";
+        skipRemaining(
+          "auth",
+          `${describeProviderError(modelsResponse!.status, body)} ${hint}`,
+        );
         return;
       } else if (!modelsResponse!.ok) {
-        skipRemaining("auth", `Unexpected status ${modelsResponse!.status}`);
+        const body = await modelsResponse!.text().catch(() => "");
+        skipRemaining("auth", describeProviderError(modelsResponse!.status, body));
         return;
       } else {
         setTestResults((prev) => ({
@@ -878,7 +879,7 @@ const AISection = ({
           ...prev,
           chat: {
             status: "fail",
-            message: `${chatResponse.status}: ${errText.slice(0, 100) || "Request failed"}`,
+            message: describeProviderError(chatResponse.status, errText),
             latencyMs,
           },
         }));
@@ -1165,9 +1166,8 @@ const AISection = ({
 
   useEffect(() => {
     if (
-      (settingsPreset?.provider === "openai" ||
-        settingsPreset?.provider === "anthropic" ||
-        settingsPreset?.provider === "custom") &&
+      settingsPreset?.provider &&
+      providerRequiresApiKey(settingsPreset.provider) &&
       !settingsPreset?.apiKey
     )
       return;
@@ -1180,9 +1180,7 @@ const AISection = ({
     if (settingsPreset?.provider === "screenpipe-cloud") return;
     if (!settingsPreset?.provider) return;
 
-    const needsApiKey =
-      settingsPreset.provider === "openai" || settingsPreset.provider === "anthropic" || settingsPreset.provider === "custom";
-    if (needsApiKey && !settingsPreset.apiKey) return;
+    if (providerRequiresApiKey(settingsPreset.provider) && !settingsPreset.apiKey) return;
 
     if (settingsPreset.provider === "openai-chatgpt" || settingsPreset.provider === "native-ollama" || settingsPreset.url) {
       const timer = setTimeout(() => {
@@ -1451,11 +1449,13 @@ const AISection = ({
                   !settingsPreset?.model && "text-muted-foreground"
                 )}
                 disabled={
-                  settingsPreset?.provider === "openai" &&
+                  !!settingsPreset?.provider &&
+                  providerRequiresApiKey(settingsPreset.provider) &&
                   !settingsPreset?.apiKey
                 }
               >
-                {settingsPreset?.provider === "openai" &&
+                {!!settingsPreset?.provider &&
+                providerRequiresApiKey(settingsPreset.provider) &&
                 !settingsPreset?.apiKey
                   ? "API key required to fetch models"
                   : settingsPreset?.model || "Select model..."}

@@ -2096,6 +2096,13 @@ pub async fn pi_start_inner(
             }
         }
 
+        if config.provider == "custom" {
+            cmd.env(
+                "CUSTOM_API_KEY",
+                screenpipe_core::agents::pi::custom_api_key(config.api_key.as_deref()),
+            );
+        }
+
         if let Some(ref api_key) = config.api_key {
             if !api_key.is_empty() {
                 // Pi resolves apiKey from env vars, so set it
@@ -2105,9 +2112,6 @@ pub async fn pi_start_inner(
                     }
                     "anthropic" => {
                         cmd.env("ANTHROPIC_API_KEY", api_key);
-                    }
-                    "custom" => {
-                        cmd.env("CUSTOM_API_KEY", api_key);
                     }
                     _ => {}
                 }
