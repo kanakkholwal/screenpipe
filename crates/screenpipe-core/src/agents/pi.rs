@@ -21,6 +21,18 @@ pub const PI_AI_PACKAGE: &str = "@earendil-works/pi-ai@0.80.6";
 pub const PI_NAMESPACE_DIR: &str = "@earendil-works";
 pub const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
 
+/// Bearer token for a keyless custom provider. pi drops any provider whose
+/// `$CUSTOM_API_KEY` resolves to nothing — empty reads the same as unset (#5482).
+pub const CUSTOM_API_KEY_PLACEHOLDER: &str = "not-required";
+
+/// Non-empty key for the `custom` provider, falling back to the placeholder.
+pub fn custom_api_key(provider_api_key: Option<&str>) -> &str {
+    match provider_api_key {
+        Some(key) if !key.is_empty() => key,
+        _ => CUSTOM_API_KEY_PLACEHOLDER,
+    }
+}
+
 /// Windows creation flags for background agent spawns: CREATE_NO_WINDOW
 /// (0x08000000) so no console flashes, plus BELOW_NORMAL_PRIORITY_CLASS
 /// (0x00004000) so the bun→pi→tool-call subtree yields CPU to whatever the
@@ -1334,6 +1346,10 @@ impl PiExecutor {
 
         // Pi resolves apiKey values in models.json as env var names.
         // Set the actual key so the subprocess can find it.
+        if resolved_provider == "custom" {
+            cmd.env("CUSTOM_API_KEY", custom_api_key(provider_api_key));
+        }
+
         if let Some(key) = provider_api_key {
             if !key.is_empty() {
                 match resolved_provider {
@@ -1345,9 +1361,6 @@ impl PiExecutor {
                     }
                     "anthropic" | "anthropic-byok" => {
                         cmd.env("ANTHROPIC_API_KEY", key);
-                    }
-                    "custom" => {
-                        cmd.env("CUSTOM_API_KEY", key);
                     }
                     "google" => {
                         cmd.env("GOOGLE_API_KEY", key);
@@ -1487,6 +1500,10 @@ impl PiExecutor {
             cmd.env("SCREENPIPE_API_KEY", token);
         }
 
+        if resolved_provider == "custom" {
+            cmd.env("CUSTOM_API_KEY", custom_api_key(provider_api_key));
+        }
+
         if let Some(key) = provider_api_key {
             if !key.is_empty() {
                 match resolved_provider {
@@ -1498,9 +1515,6 @@ impl PiExecutor {
                     }
                     "anthropic" | "anthropic-byok" => {
                         cmd.env("ANTHROPIC_API_KEY", key);
-                    }
-                    "custom" => {
-                        cmd.env("CUSTOM_API_KEY", key);
                     }
                     "google" => {
                         cmd.env("GOOGLE_API_KEY", key);
@@ -3286,6 +3300,17 @@ pub fn ensure_bash_available() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_api_key_is_never_empty() {
+        assert_eq!(custom_api_key(None), CUSTOM_API_KEY_PLACEHOLDER);
+        assert_eq!(custom_api_key(Some("")), CUSTOM_API_KEY_PLACEHOLDER);
+    }
+
+    #[test]
+    fn custom_api_key_passes_through_a_configured_key() {
+        assert_eq!(custom_api_key(Some("sk-local")), "sk-local");
+    }
 
     #[test]
     fn structured_output_extension_keeps_screen_text_out_of_system_state() {

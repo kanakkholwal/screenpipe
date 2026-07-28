@@ -286,12 +286,23 @@ export const validateUrl = (url: string): FieldValidationResult => {
   }
 };
 
+/** Keyless-custom bearer token. Must match `CUSTOM_API_KEY_PLACEHOLDER` in screenpipe-core's pi.rs (#5482). */
+export const CUSTOM_API_KEY_PLACEHOLDER = "not-required";
+
+/**
+ * Custom and local providers are exempt: unprotected servers (Ollama, Lemonade) take no key (#5482).
+ */
+export const providerRequiresApiKey = (provider: AIProviderType): boolean =>
+  provider === "openai" || provider === "anthropic";
+
 // API key validation
 export const validateApiKey = (apiKey: string, provider: AIProviderType): FieldValidationResult => {
   if (!apiKey.trim()) {
-    return { isValid: false, error: "API key is required" };
+    return providerRequiresApiKey(provider)
+      ? { isValid: false, error: "API key is required" }
+      : { isValid: true };
   }
-  
+
   switch (provider) {
     case "openai":
       if (!apiKey.startsWith("sk-")) {
@@ -309,6 +320,20 @@ export const validateApiKey = (apiKey: string, provider: AIProviderType): FieldV
   }
   
   return { isValid: true };
+};
+
+/**
+ * Credential gate shared by preset save (settings + chat) and pipe run, so all
+ * three agree on when a preset is usable (#5482).
+ */
+export const validatePresetCredentials = (
+  provider: AIProviderType | undefined | null,
+  apiKey: string | undefined | null,
+): FieldValidationResult => {
+  if (!provider) {
+    return { isValid: false, error: "Select a provider" };
+  }
+  return validateApiKey(apiKey ?? "", provider);
 };
 
 // Context length validation

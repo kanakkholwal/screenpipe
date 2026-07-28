@@ -68,6 +68,12 @@ import { parsePipeSessionId } from "@/lib/events/types";
 import { ChatPrefillData } from "@/lib/chat-utils";
 import { commands } from "@/lib/utils/tauri";
 import { cn } from "@/lib/utils";
+import { validatePresetCredentials } from "@/lib/utils/validation";
+import {
+  describeNetworkError,
+  describeProviderError,
+  humanizeErrorText,
+} from "@/lib/utils/provider-error";
 import { describeSchedule, type ScheduleConfig } from "@/lib/utils/schedule-builder";
 import {
   PipeActivityIndicator,
@@ -1053,6 +1059,10 @@ export function PipesSection() {
   const pendingSaves = useRef<Record<string, string>>({});
   // Track in-flight config saves so runPipe can await them
   const pendingConfigSaves = useRef<Record<string, Promise<void>>>({});
+  // Executions already surfaced as a toast, plus the pipes whose existing history
+  // has been absorbed — without the latter, expanding a pipe toasts every past failure.
+  const notifiedFailuresRef = useRef<Set<string>>(new Set());
+  const seededFailurePipesRef = useRef<Set<string>>(new Set());
   const { settings, updateSettings } = useSettings();
   const { toast } = useToast();
   const [, setSection] = useQueryState("section");
@@ -1648,6 +1658,34 @@ export function PipesSection() {
     return () => clearInterval(interval);
   }, [fetchPipes]);
 
+  /** Toast each newly-failed execution once; the first sighting of a pipe only seeds. */
+  const notifyNewFailedExecutions = useCallback(
+    (pipeName: string, executions: PipeExecution[]) => {
+      const seeding = !seededFailurePipesRef.current.has(pipeName);
+      seededFailurePipesRef.current.add(pipeName);
+
+      for (const exec of executions) {
+        if (pipeExecutionDisplayStatus(exec) !== "failed") continue;
+        const key = `${exec.pipe_name}:${exec.id}`;
+        if (notifiedFailuresRef.current.has(key)) continue;
+        notifiedFailuresRef.current.add(key);
+        if (seeding) continue;
+
+        const lastLine = (exec.stderr || "").trim().split("\n").filter(Boolean).pop();
+        toast({
+          title: `Pipe "${exec.pipe_name}" run failed`,
+          description:
+            humanizeErrorText(lastLine ?? "") ||
+            (exec.exit_code !== null
+              ? `Exited with code ${exec.exit_code}.`
+              : "See logs for details."),
+          variant: "destructive",
+        });
+      }
+    },
+    [toast],
+  );
+
   const pollRunningPipe = useCallback(async () => {
     // Lightweight poll: only refresh pipe statuses + expanded pipe's executions
     try {
@@ -1660,6 +1698,7 @@ export function PipesSection() {
           const nextExecutions = execData.data || [];
           setExecutions(nextExecutions);
           setHasMoreExecutions(nextExecutions.length === PIPE_EXECUTIONS_PAGE_LIMIT);
+          notifyNewFailedExecutions(exp, nextExecutions);
           const finishedKeys = (execData.data || [])
             .filter((e: PipeExecution) => e.status !== "running")
             .map((e: PipeExecution) => `${e.pipe_name}:${e.id}`);
@@ -1681,7 +1720,7 @@ export function PipesSection() {
     } catch {
       // ignore — next poll will retry
     }
-  }, [fetchPipes, apiBase]);
+  }, [fetchPipes, apiBase, notifyNewFailedExecutions]);
 
   // Poll faster (3s) when any pipe is running to update status + expanded executions
   const anyPipeRunning = pipes.some((p) => p.is_running) || runningPipe !== null;
@@ -1803,15 +1842,48 @@ export function PipesSection() {
     }
   };
 
+  /** Preset the pipe will run under: its primary, else the app-wide default. */
+  const resolvePipeAiPreset = (name: string) => {
+    const config = pipes.find((p) => p.config.name === name)?.config;
+    const presetIds = Array.isArray(config?.preset)
+      ? config.preset
+      : config?.preset
+        ? [config.preset]
+        : [];
+    const primaryId = presetIds.find((id) => id && id !== "auto");
+    return primaryId
+      ? settings?.aiPresets?.find((p) => p.id === primaryId)
+      : settings?.aiPresets?.find((p) => p.defaultPreset);
+  };
+
   const runPipe = async (name: string) => {
+    // Let an in-flight preset change land first, or the gate below validates the
+    // preset the pipe just stopped using (#5482).
+    if (name in pendingConfigSaves.current) {
+      await pendingConfigSaves.current[name];
+    }
+
+    // Gate before the spinner and the analytics event: a pipe blocked on an
+    // unusable preset never started, so it must not look or count as a run (#5482).
+    const aiPreset = resolvePipeAiPreset(name);
+    if (aiPreset) {
+      const credentials = validatePresetCredentials(
+        aiPreset.provider,
+        (aiPreset as { apiKey?: string | null }).apiKey,
+      );
+      if (!credentials.isValid) {
+        toast({
+          title: "Cannot run pipe",
+          description: `AI preset "${aiPreset.id}": ${credentials.error}`,
+          variant: "destructive",
+        });
+        return;
+      }
+    }
+
     posthog.capture("pipe_run", { pipe: name });
     setRunningPipe(name);
     try {
-      // Wait for any pending config save (e.g. preset change) to land first
-      if (name in pendingConfigSaves.current) {
-        await pendingConfigSaves.current[name];
-      }
-
       // Validate required connections are configured
       const pipe = pipes.find((p) => p.config.name === name);
       const requiredConnections: string[] = pipe?.config?.connections ?? [];
@@ -1829,15 +1901,30 @@ export function PipesSection() {
       }
 
       const minDelay = new Promise((r) => setTimeout(r, 2000));
-      await fetch(`${apiBase}/pipes/${name}/run`, {
+      const res = await fetch(`${apiBase}/pipes/${name}/run`, {
         method: "POST",
       });
+      // A rejected run used to surface only in the logs panel once polling caught up.
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        toast({
+          title: "Pipe failed to start",
+          description: describeProviderError(res.status, detail),
+          variant: "destructive",
+        });
+      }
       if (expanded === name) {
         fetchLogs(name);
         fetchExecutions(name);
       }
       // Keep loading state visible until the backend has time to start the process
       await minDelay;
+    } catch (err) {
+      toast({
+        title: "Pipe failed to start",
+        description: describeNetworkError(err),
+        variant: "destructive",
+      });
     } finally {
       setRunningPipe(null);
       fetchPipes();
