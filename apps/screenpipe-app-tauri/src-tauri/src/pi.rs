@@ -2749,12 +2749,18 @@ pub async fn pi_start_inner(
                     "anthropic" => {
                         cmd.env("ANTHROPIC_API_KEY", api_key);
                     }
-                    "custom" => {
-                        cmd.env("CUSTOM_API_KEY", api_key);
-                    }
                     _ => {}
                 }
             }
+        }
+
+        // Set unconditionally: an empty key must still export the placeholder,
+        // or pi drops the custom provider entirely (#5482).
+        if config.provider == "custom" {
+            cmd.env(
+                "CUSTOM_API_KEY",
+                screenpipe_core::agents::pi::custom_api_key(config.api_key.as_deref()),
+            );
         }
     }
 

@@ -117,6 +117,11 @@ import {
 import { useSettings } from "@/lib/hooks/use-settings";
 import { AIPresetsSelector } from "@/components/rewind/ai-presets-selector";
 import { useToast } from "@/components/ui/use-toast";
+import {
+  extractAiProviderErrorMessage,
+  validateAiPresetConnectionFields,
+} from "@/lib/utils/validation";
+import { resolvePipeAiPreset } from "@/lib/utils/pipe-preset";
 import { useQueryState } from "nuqs";
 import { parseEnterpriseManagedVersion } from "@/lib/hooks/use-enterprise-pipes";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
@@ -1984,6 +1989,24 @@ export function PipesSection() {
 
       // Validate required connections are configured
       const pipe = pipes.find((p) => p.config.name === name);
+
+      // Gate on the preset's credentials before spawning: pi otherwise fails
+      // mid-run with a raw CLI error the user never sees (#5482).
+      const aiPreset = resolvePipeAiPreset(pipe?.config?.preset, settings?.aiPresets);
+      if (aiPreset) {
+        const errors = validateAiPresetConnectionFields(aiPreset);
+        const firstError = Object.values(errors)[0];
+        if (firstError) {
+          toast({
+            title: `Preset "${aiPreset.id}" is not ready`,
+            description: `${firstError} Update it in Settings → AI presets.`,
+            variant: "destructive",
+          });
+          setRunningPipe(null);
+          return;
+        }
+      }
+
       const requiredConnections: string[] = pipe?.config?.connections ?? [];
       if (requiredConnections.length > 0) {
         const missing = requiredConnections.filter((id) => {
@@ -1999,9 +2022,19 @@ export function PipesSection() {
       }
 
       const minDelay = new Promise((r) => setTimeout(r, 2000));
-      await fetch(`${apiBase}/pipes/${name}/run`, {
+      const res = await fetch(`${apiBase}/pipes/${name}/run`, {
         method: "POST",
       });
+      if (!res.ok) {
+        toast({
+          title: "Pipe failed to start",
+          description: extractAiProviderErrorMessage(
+            await res.text().catch(() => ""),
+            `The server returned ${res.status}.`,
+          ),
+          variant: "destructive",
+        });
+      }
       if (expanded === name) {
         fetchLogs(name);
         fetchExecutions(name);

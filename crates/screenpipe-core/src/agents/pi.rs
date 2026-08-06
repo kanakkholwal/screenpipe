@@ -23,6 +23,18 @@ pub const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
 const CUSTOM_PROVIDER_USER_AGENT: &str = "screenpipe";
 const DEFAULT_CLOUD_MAX_OUTPUT_TOKENS: u64 = 32_000;
 
+/// Bearer token for a keyless custom provider. pi drops any provider whose
+/// `$CUSTOM_API_KEY` resolves to nothing — empty reads the same as unset (#5482).
+pub const CUSTOM_API_KEY_PLACEHOLDER: &str = "not-required";
+
+/// Non-empty key for the `custom` provider, falling back to the placeholder.
+pub fn custom_api_key(provider_api_key: Option<&str>) -> &str {
+    match provider_api_key {
+        Some(key) if !key.is_empty() => key,
+        _ => CUSTOM_API_KEY_PLACEHOLDER,
+    }
+}
+
 /// Apply compatibility settings required by OpenAI-compatible custom endpoints.
 ///
 /// The OpenAI JavaScript SDK identifies itself as `OpenAI/JS ...`. Some generic
@@ -1458,9 +1470,6 @@ impl PiExecutor {
                     "anthropic" | "anthropic-byok" => {
                         cmd.env("ANTHROPIC_API_KEY", key);
                     }
-                    "custom" => {
-                        cmd.env("CUSTOM_API_KEY", key);
-                    }
                     "google" => {
                         cmd.env("GOOGLE_API_KEY", key);
                     }
@@ -1471,6 +1480,12 @@ impl PiExecutor {
                     _ => {}
                 }
             }
+        }
+
+        // Set unconditionally: an empty key must still export the placeholder,
+        // or pi drops the custom provider entirely (#5482).
+        if resolved_provider == "custom" {
+            cmd.env("CUSTOM_API_KEY", custom_api_key(provider_api_key));
         }
 
         // Canonical name: SCREENPIPE_LOCAL_API_KEY. The AUTH_KEY alias is
@@ -1611,9 +1626,6 @@ impl PiExecutor {
                     "anthropic" | "anthropic-byok" => {
                         cmd.env("ANTHROPIC_API_KEY", key);
                     }
-                    "custom" => {
-                        cmd.env("CUSTOM_API_KEY", key);
-                    }
                     "google" => {
                         cmd.env("GOOGLE_API_KEY", key);
                     }
@@ -1624,6 +1636,12 @@ impl PiExecutor {
                     _ => {}
                 }
             }
+        }
+
+        // Set unconditionally: an empty key must still export the placeholder,
+        // or pi drops the custom provider entirely (#5482).
+        if resolved_provider == "custom" {
+            cmd.env("CUSTOM_API_KEY", custom_api_key(provider_api_key));
         }
 
         // See spawn_pi above — TODO(remove next release): drop the deprecated alias.
@@ -3721,6 +3739,23 @@ pub fn ensure_bash_available() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_api_key_falls_back_to_placeholder_when_absent_or_empty() {
+        assert_eq!(custom_api_key(None), CUSTOM_API_KEY_PLACEHOLDER);
+        assert_eq!(custom_api_key(Some("")), CUSTOM_API_KEY_PLACEHOLDER);
+    }
+
+    #[test]
+    fn custom_api_key_preserves_a_real_key() {
+        assert_eq!(custom_api_key(Some("lemonade-token")), "lemonade-token");
+    }
+
+    #[test]
+    fn custom_api_key_placeholder_is_non_empty() {
+        // An empty value reads as unset to pi, which is the bug this guards.
+        assert!(!CUSTOM_API_KEY_PLACEHOLDER.is_empty());
+    }
 
     #[test]
     fn tool_use_without_an_executable_call_is_a_protocol_error() {
